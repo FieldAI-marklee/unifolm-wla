@@ -62,6 +62,7 @@ def _adapt_multi_source_batch(batch: dict) -> list:
             "state_mask": batch["state_mask"][i].cpu().numpy(),
             "arm_type": batch["arm_type"][i],
             "robot_type": batch["robot_type"][i],
+            "embodiment": batch["embodiment"][i] if "embodiment" in batch else batch["robot_type"][i],
         })
     return examples
 
@@ -378,9 +379,13 @@ class Qwen_MMDiT(baseframework):
         return {"normalized_actions": normalized_actions}
 
     def _build_body_type_ids(self, examples, device):
-        """Map each example's robot_type string -> embodiment embedding id (0 = unknown)."""
+        """Map each example's embodiment (default: robot_type) -> embodiment embedding id (0 = unknown).
+
+        An embodiment this model was not trained with falls back to its robot_type, so a checkpoint
+        without the extra type (e.g. the base model) still scores such a source as its robot.
+        """
         if not examples or "robot_type" not in examples[0]:
             return None
         emb_map = build_embodiment_map(self.action_model.embodiment_types)
-        ids = [emb_map.get(e.get("robot_type"), 0) for e in examples]
+        ids = [emb_map.get(e.get("embodiment"), emb_map.get(e.get("robot_type"), 0)) for e in examples]
         return torch.tensor(ids, dtype=torch.long, device=device)

@@ -42,6 +42,36 @@ class _CpuAcceleratorWorkerDataLoader(DataLoader):
                 os.environ["DS_ACCELERATOR"] = prev
 
 
+class WeightedMixtureSampler(DistributedSampler):
+    """Draw sources with probability proportional to their `weight`, regardless of their length.
+
+    Each sample of source s gets weight ``w_s / len(s)`` and indices are drawn with replacement,
+    so a small source is revisited while a large one is subsampled. The draw is seeded by
+    ``seed + epoch`` (``set_epoch`` reshuffles) and is identical on every rank; each rank keeps
+    its ``rank::num_replicas`` slice, as DistributedSampler does.
+    """
+
+    def __init__(self, dataset, weights: list[float], lengths: list[int], num_replicas: int = 1,
+                 rank: int = 0, seed: int = 0, num_samples: int | None = None):
+        super().__init__(dataset, num_replicas=num_replicas, rank=rank, shuffle=True, seed=seed)
+        if any(n == 0 for n in lengths):
+            raise ValueError(f"weighted mixture sampling needs every enabled source non-empty, got lengths {lengths}")
+        w = torch.cat([torch.full((n,), wt / n, dtype=torch.float64) for wt, n in zip(weights, lengths)])
+        self.sample_weights = w / w.sum()
+        self.total_size = num_samples or len(dataset)
+        self.total_size -= self.total_size % num_replicas
+        self.num_samples = self.total_size // num_replicas
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        idx = torch.multinomial(self.sample_weights, self.total_size, replacement=True, generator=g)
+        return iter(idx[self.rank:self.total_size:self.num_replicas].tolist())
+
+    def __len__(self):
+        return self.num_samples
+
+
 def collate_fn(batch: list[dict]) -> dict:
     """Custom collate function for mixed robot data.
 
@@ -120,6 +150,8 @@ def collate_fn(batch: list[dict]) -> dict:
     result["task"] = [b["task"] for b in batch]
     result["arm_type"] = [b["arm_type"] for b in batch]
     result["robot_type"] = [b["robot_type"] for b in batch]
+    result["embodiment"] = [b.get("embodiment") or b["robot_type"] for b in batch]
+    result["source"] = [b.get("source", "") for b in batch]
 
     return result
 
@@ -138,8 +170,10 @@ def create_training_dataloader(
     """Create a training DataLoader for one or more dataset sources.
 
     Every enabled source is built independently and concatenated into one
-    map-style dataset. Sampling is therefore proportional to source length;
-    per-source ``weight`` values are not applied.
+    map-style dataset. With the default ``mixture_sampling: proportional``,
+    sampling is proportional to source length and per-source ``weight`` values
+    are not applied; ``mixture_sampling: weighted`` draws each source with
+    probability proportional to its ``weight`` (WeightedMixtureSampler).
 
     Args:
         config_path: path to YAML config
@@ -185,7 +219,23 @@ def create_training_dataloader(
         )
 
     sampler = None
-    if distributed:
+    if config.mixture_sampling == "weighted":
+        weights = [s.config.weight for s in source_datasets]
+        lengths = [len(s) for s in source_datasets]
+        sampler = WeightedMixtureSampler(
+            dataset, weights, lengths,
+            num_replicas=num_replicas if distributed else 1,
+            rank=rank if distributed else 0,
+            seed=config.sample_seed,
+        )
+        logger.info(
+            "Weighted mixture sampling: %s",
+            ", ".join(f"{s.config.name}: weight={w / sum(weights):.3f} len={n}"
+                      for s, w, n in zip(source_datasets, weights, lengths)),
+        )
+    elif config.mixture_sampling != "proportional":
+        raise ValueError(f"mixture_sampling must be 'proportional' or 'weighted', got {config.mixture_sampling!r}")
+    elif distributed:
         sampler = DistributedSampler(
             dataset, num_replicas=num_replicas, rank=rank, shuffle=shuffle,
         )

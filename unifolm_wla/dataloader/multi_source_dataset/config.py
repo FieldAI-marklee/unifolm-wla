@@ -87,6 +87,10 @@ class DatasetSourceConfig:
     enabled: bool = True
     weight: float = 1.0
     multi_task: bool = False
+    # Embodiment-embedding type (action_model.embodiment_types) for this source; None -> robot_type.
+    # Lets a source keep robot_type's dataset class / key layout but get its own conditioning id,
+    # e.g. a different teleop recorder whose labels follow other conventions on the same robot.
+    embodiment: Optional[str] = None
     # For robochallenge: list of sub-robot dirs, each with multi-task
     sub_robot_dirs: Optional[list[str]] = None
 
@@ -139,6 +143,8 @@ class TrainingDataConfig:
     sample_fraction: Optional[float] = None
     sample_seed: int = 0
     sample_strategy: str = "per_task"  # "per_task" or "per_source"
+    # "proportional": sources sampled by length (weights ignored); "weighted": by per-source weight
+    mixture_sampling: str = "proportional"
 
     # Image roles that the model expects (union of all possible cameras)
     image_roles: list[str] = field(default_factory=lambda: [
@@ -179,6 +185,7 @@ def _build_dataset_config(raw: dict, data_base: str = "") -> DatasetSourceConfig
         enabled=raw.get("enabled", True),
         weight=raw.get("weight", 1.0),
         multi_task=raw.get("multi_task", False),
+        embodiment=raw.get("embodiment"),
         sub_robot_dirs=raw.get("sub_robot_dirs"),
         peer_data_paths=peer_paths,
         merge_left_right_ee_stats=raw.get("merge_left_right_ee_stats", False),
@@ -218,6 +225,7 @@ def load_config(config_path: str | Path) -> TrainingDataConfig:
         sample_fraction=raw.get("sample_fraction"),
         sample_seed=raw.get("sample_seed", 0),
         sample_strategy=raw.get("sample_strategy", "per_task"),
+        mixture_sampling=raw.get("mixture_sampling", "proportional"),
         image_roles=raw.get("image_roles", [
             "cam_high", "cam_wrist", "cam_side",
             "cam_wrist_left", "cam_wrist_right",

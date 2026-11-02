@@ -293,6 +293,40 @@ class TrainerUtils:
         return num_params, num_trainable_params
 
     @staticmethod
+    def _grow_embodiment_embedding(model, checkpoint):
+        """Pad a checkpoint's embodiment table when the config appends embodiment types.
+
+        The checkpoint's types must be a prefix of `action_model.embodiment_types` (row i+1 = type i,
+        row 0 = unknown). Each appended row is copied from the row named in
+        `action_model.embodiment_init_from` ({new_type: existing_type}), so a new type starts out
+        conditioned exactly like that type; without an entry it keeps its random init.
+        """
+        key = "action_model.embodiment_embedding.weight"
+        head = getattr(model, "action_model", None)
+        if key not in checkpoint or head is None:
+            return
+        old, new = checkpoint[key], head.embodiment_embedding.weight
+        if old.shape[0] >= new.shape[0] or old.shape[1:] != new.shape[1:]:
+            return
+        types = list(head.embodiment_types)
+        init_from = dict(head.config.get("embodiment_init_from", None) or {})
+        grown = new.detach().to(device="cpu", dtype=old.dtype).clone()
+        grown[: old.shape[0]] = old
+        for row in range(old.shape[0], new.shape[0]):
+            name = types[row - 1]
+            src = init_from.get(name)
+            if src is None:
+                print(f"⚠️ embodiment '{name}' (row {row}) not in checkpoint and has no embodiment_init_from: random init")
+                continue
+            src_row = types.index(src) + 1
+            if src_row >= old.shape[0]:
+                raise ValueError(f"embodiment_init_from[{name}] = {src} is not a checkpoint embodiment")
+            grown[row] = old[src_row]
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                print(f"🧬 embodiment '{name}' (row {row}) initialized from '{src}' (row {src_row})")
+        checkpoint[key] = grown
+
+    @staticmethod
     def load_pretrained_backbones(model, checkpoint_path=None, reload_modules=None, remove_modules=None):
         """
         load checkpoint:
@@ -344,6 +378,7 @@ class TrainerUtils:
                 except AttributeError:
                     print(f"❌ cannot find module path: {path}")
         else:  # full load
+            TrainerUtils._grow_embodiment_embedding(model, checkpoint)
             try:
                 model.load_state_dict(checkpoint, strict=False)
                 if dist.get_rank() == 0:

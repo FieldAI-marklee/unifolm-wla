@@ -1,0 +1,103 @@
+# Frozen-VLM post-training of UnifoLM-WLA-1.0-Base on HIW-500 level-1 (stationary) data, co-trained
+# with a Unitree G1-Dex1 replay pool so the base model does not regress on Unitree.
+# Derived from mmdit_finetune_frozen_vlm.yaml; differences:
+#   data        hiw500_l1.yaml: weighted mixture HIW 0.7 / Unitree replay 0.3 (mixture_sampling: weighted);
+#               HIW has its own embodiment id (unitree_hiw)
+#   batch       4 x 4 accumulation = 16 per optimizer step (stock 1 x 8; single 32 GB GPU)
+#   lr          5e-5 (stock 1e-4) to limit drift of the action head on Unitree; 500 warmup steps (stock 200)
+#   steps       20k (stock); checkpoints every 5000 (stock 2000), validation every 2000 (stock)
+#   state       the robot-state projector trains (stock intent; "qwen_vl_interface" also froze it)
+#   logging     TensorBoard + wandb (offline by default), per-source validation at step 0 and every eval_interval
+# Previous runs: hiw500_l1_cotrain_prelim_v1 (16 HIW episodes, 1500 steps, HIW 0.5, projector frozen).
+run_id: hiw500_l1_cotrain_full_v1
+run_root_dir: playground/Checkpoints
+seed: 42
+wandb_entity: null
+wandb_project: unifolm_wla_hiw500_l1
+wandb_mode: offline
+is_debug: false
+
+framework:
+  name: QwenMMDiT
+  qwenvl:
+    # Overridden at launch to <base_model_dir>/tokenizer (see mmdit_finetune_frozen_vlm.yaml).
+    base_vlm: /path/to/UnifoLM-WLA-1.0-Base/tokenizer
+    attn_implementation: flash_attention_2
+    vl_hidden_dim: 2560
+  robot_state_projector:
+    enabled: true
+    input_dim: 120
+    projector_hidden_size: null
+    load_from: null
+  action_model:
+    action_model_type: DiT-L
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    action_dim: 54
+    state_dim: 0
+    action_horizon: 30
+    repeated_diffusion_steps: 1
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 4
+    # HIW-500 is the same G1-Dex1 robot recorded by a different teleop stack whose labels follow other
+    # conventions (gripper = scaled trigger, no stall at the object; derived gripper state), so it gets its
+    # own conditioning id (data config `embodiment: unitree_hiw`). Appended types must keep the base
+    # checkpoint's order; the new row starts as a copy of "unitree", i.e. the base model at step 0.
+    embodiment_types: ["unitree", "unitree_hiw"]
+    embodiment_init_from: {unitree_hiw: unitree}
+    diffusion_model_cfg:
+      cross_attention_dim: 2560
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: "ada_norm"
+      num_layers: 16
+      num_attention_heads: 32
+      attention_head_dim: 48
+      output_dim: 1024
+      positional_embeddings: null
+
+datasets:
+  vla_data:
+    dataset_py: multi_source_datasets
+    data_config_path: unifolm_wla/dataloader/multi_source_dataset/configs/hiw500_l1.yaml
+    per_device_batch_size: 4
+    # host RAM is the limit on a 60 GB box with CPU-offloaded Adam (~50 GB in use); data wait is ~1 ms/batch at 4
+    num_workers: 2
+
+trainer:
+  # Overridden at launch to <base_model_dir>/checkpoints/model.safetensors.
+  pretrained_checkpoint: /path/to/UnifoLM-WLA-1.0-Base/checkpoints/model.safetensors
+  is_resume: false
+  # Freeze the VLM (language model + lm_head) but train the robot-state projector, which lives at
+  # qwen_vl_interface.model.robot_state_projector and is the model's only state input (state_dim: 0).
+  # Its output enters the VLM's input embeddings, so this backprops through the frozen VLM: measured
+  # +8 GB GPU (24.6 GB peak) and ~3.5 s vs ~2.4 s per optimizer step. "qwen_vl_interface" freezes it too.
+  freeze_modules: "qwen_vl_interface.model.model,qwen_vl_interface.model.lm_head"
+  max_train_steps: 20000
+  num_warmup_steps: 500
+  save_interval: 5000
+  eval_interval: 2000
+  logging_frequency: 10
+  gradient_accumulation_steps: 4
+  gradient_clipping: 1.0
+  # Per-source validation (val/<source>/masked_mse, val/<source>/ee_pos_mm) on fixed samples, at step 0
+  # (the base model) and every eval_interval. ~1 min per pass at 256 per source.
+  val_data_config_path: unifolm_wla/dataloader/multi_source_dataset/configs/hiw500_l1_val.yaml
+  val_samples_per_source: 256
+  val_batch_size: 8
+  learning_rate:
+    base: 5.0e-05
+    action_model: 5.0e-05
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  optimizer:
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  save_format: safetensors

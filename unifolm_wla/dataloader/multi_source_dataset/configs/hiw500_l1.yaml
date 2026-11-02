@@ -1,0 +1,159 @@
+# HIW-500 level-1 (stationary, legs still) post-training of UnifoLM-WLA-1.0-Base.
+# Data: wla_verify/convert_hiw_l1.py -> <data_base>/HIW500_L1_G1Dex1/<task>/ (Unitree G1-Dex1 keys, so the
+# precollected stats in stats/ apply by key name). Held-out episodes live in the sibling
+# HIW500_L1_G1Dex1_heldout/ and are never loaded here.
+# HIW-500 has no leg commands: the leg keys are removed from action_keys (the loader requires every
+# action key; a missing one raises KeyError at the first sample), so the leg slots are masked out of
+# the loss. Leg STATE is measured and stays (Unitree tabletop sets log it too).
+# Co-trained with a Unitree G1-Dex1 replay group so the base model does not regress on Unitree. Sources
+# are drawn by `weight` (mixture_sampling: weighted), not by length (HIW 768k frames, replay 1.22M).
+# Validation during training: hiw500_l1_val.yaml (HIW held-out + Unitree val episodes).
+# The WBT group is listed but disabled (no local copy).
+# Clear cache_dir after any reconversion in place: the arrow cache key ignores file contents.
+mixture_sampling: "weighted"
+target_fps: 30
+chunk_size: 30  # 1 second at 30 FPS
+image_size: [336, 448]
+norm_type: "minmax_q"
+rel_norm_type: "zscore"
+state_norm_type: "minmax_q"
+gripper_norm_type: "minmax_q"
+data_base: "/home/mark.lee/manipulation/wla_data"
+cache_dir: "/home/mark.lee/manipulation/wla_data/cache_hiw500_l1"
+
+# ============================================================
+# YAML anchors (top-level keys, ignored by Python loader)
+# ============================================================
+.unitree_base: &unitree_base
+  enabled: true
+  weight: 1.0
+  robot_type: "unitree"
+  source_fps: 30
+  arm_type: "dual_with_legs"
+  ee_format: "xyz_rpy"
+  multi_task: true
+  merge_left_right_ee_stats: true
+  precollected_stats_path: "unifolm_wla/dataloader/multi_source_dataset/stats"
+  action_keys:
+    left_ee_pose: "action.left_ee_pose_gripper_base"
+    right_ee_pose: "action.right_ee_pose_gripper_base"
+    left_gripper: "action.left_gripper"
+    right_gripper: "action.right_gripper"
+    waist_joint: "action.waist_action_joint"
+    base_command: "action.base_command"
+    left_leg: "action.left_leg"
+    right_leg: "action.right_leg"
+  state_keys:
+    left_ee_pose: "observation.state.left_ee_pose_gripper_base"
+    right_ee_pose: "observation.state.right_ee_pose_gripper_base"
+    left_gripper: "observation.state.left_gripper"
+    right_gripper: "observation.state.right_gripper"
+    waist_joint: "observation.state.waist_state_joint"
+    left_leg: "observation.state.left_leg"
+    right_leg: "observation.state.right_leg"
+  relative_stats_key_map:
+    left_ee_pose: "left_ee_pose_gripper_base"
+    right_ee_pose: "right_ee_pose_gripper_base"
+  base_command_dims:
+    vx: 0
+    vy: 1
+    vw: 2
+    height: 3
+
+.unitree_fullbody_base: &unitree_fullbody_base
+  enabled: true
+  weight: 1.0
+  robot_type: "unitree"
+  source_fps: 30
+  arm_type: "dual_with_legs"
+  ee_format: "xyz_rpy"
+  multi_task: true
+  merge_left_right_ee_stats: true
+  precollected_stats_path: "unifolm_wla/dataloader/multi_source_dataset/stats"
+  action_keys:
+    left_ee_pose: "action.left_ee_pose_gripper_base"
+    right_ee_pose: "action.right_ee_pose_gripper_base"
+    left_fig6d: "action.left_fig6d"
+    right_fig6d: "action.right_fig6d"
+    waist_joint: "action.waist_action_joint"
+    base_command: "action.base_command"
+    left_leg: "action.left_leg"
+    right_leg: "action.right_leg"
+    base_pose: "action.action_base_pose"
+  state_keys:
+    left_ee_pose: "observation.state.left_ee_pose_gripper_base"
+    right_ee_pose: "observation.state.right_ee_pose_gripper_base"
+    left_fig6d: "observation.state.left_fig6d"
+    right_fig6d: "observation.state.right_fig6d"
+    waist_joint: "observation.state.waist_state_joint"
+    left_leg: "observation.state.left_leg"
+    right_leg: "observation.state.right_leg"
+    base_pose: "observation.state.state_base_pose"
+    base_rot: "observation.state.state_base_rot"
+
+  relative_stats_key_map:
+    left_ee_pose: "left_ee_pose_gripper_base"
+    right_ee_pose: "right_ee_pose_gripper_base"
+    base_pose: "action_base_pose"
+  base_command_dims:
+    vx: 0
+    vy: 1
+    vw: 2
+    height: 3
+
+.unitree_img_with_stereo: &unitree_img_with_stereo
+  - key: "observation.images.head_stereo_left_rec"
+    role: "head_left"
+  - key: "observation.images.wrist_left"
+    role: "cam_wrist_left"
+  - key: "observation.images.wrist_right"
+    role: "cam_wrist_right"
+
+.unitree_img_wo_stereo: &unitree_img_wo_stereo
+  - key: "observation.images.head_stereo_left"
+    role: "head_left"
+  - key: "observation.images.wrist_left"
+    role: "cam_wrist_left"
+  - key: "observation.images.wrist_right"
+    role: "cam_wrist_right"
+
+image_roles:
+  - "head_left"
+  - "cam_wrist_left"
+  - "cam_wrist_right"
+
+datasets:
+
+  # Unitree G1-Dex1 replay (wla_verify/build_unitree_replay.py): stationary tabletop + UniBot episodes
+  # of the local partial mirrors, minus the frozen eval set; meta/train_episodes.json limits each task
+  # dir to the episodes on disk. Named like the base checkpoint's stats key, so dataset_statistics.json
+  # of the fine-tuned run carries "UnifoLM_G1_Dex1" with the base normalizer.
+  - <<: *unitree_base
+    name: "UnifoLM_G1_Dex1"
+    data_path: "UnifoLM_G1_Dex1_replay/"
+    image_keys: *unitree_img_wo_stereo
+    weight: 0.3
+
+  - <<: *unitree_fullbody_base
+    name: "UnifoLM_WBT_Dataset"
+    data_path: "UnifoLM_WBT_Dataset/"
+    image_keys: *unitree_img_wo_stereo
+    enabled: false
+
+  - <<: *unitree_base
+    name: "HIW500_L1_G1Dex1"
+    data_path: "HIW500_L1_G1Dex1/"
+    image_keys: *unitree_img_wo_stereo
+    # 0.7: HIW's scenes and backgrounds vary far more than the Unitree tabletop / UniBot sets, so it
+    # carries most of the visual diversity; the 0.3 replay share guards against Unitree regression
+    weight: 0.7
+    # own embodiment id (training config embodiment_types): HIW gripper/state labels follow the HIW
+    # recorder's conventions, which differ from Unitree's on the same robot
+    embodiment: "unitree_hiw"
+    action_keys:
+      left_ee_pose: "action.left_ee_pose_gripper_base"
+      right_ee_pose: "action.right_ee_pose_gripper_base"
+      left_gripper: "action.left_gripper"
+      right_gripper: "action.right_gripper"
+      waist_joint: "action.waist_action_joint"
+      base_command: "action.base_command"

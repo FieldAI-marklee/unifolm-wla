@@ -1,4 +1,5 @@
 import argparse
+import collections
 import json
 import os
 import time
@@ -15,6 +16,7 @@ from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from transformers import AutoProcessor, get_scheduler
 
@@ -76,17 +78,55 @@ def prepare_data(cfg, accelerator, output_dir) -> DataLoader:
     return vla_train_dataloader
 
 
+_SAFETENSORS_DTYPES = {
+    torch.float64: "F64", torch.float32: "F32", torch.float16: "F16", torch.bfloat16: "BF16",
+    torch.int64: "I64", torch.int32: "I32", torch.int16: "I16", torch.int8: "I8",
+    torch.uint8: "U8", torch.bool: "BOOL",
+}
+
+
+def save_safetensors_streaming(state_dict, path):
+    """Write a safetensors file one tensor at a time.
+
+    safetensors.save_file materializes the whole file in host RAM (~12 GB here), which on top of the
+    CPU-offloaded optimizer gets the process (and the IDE) OOM-killed.
+    """
+    header, offset = {"__metadata__": {"format": "pt"}}, 0
+    for k, t in state_dict.items():
+        n = t.numel() * t.element_size()
+        header[k] = {"dtype": _SAFETENSORS_DTYPES[t.dtype], "shape": list(t.shape), "data_offsets": [offset, offset + n]}
+        offset += n
+    hb = json.dumps(header, separators=(",", ":")).encode()
+    hb += b" " * (-len(hb) % 8)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(len(hb).to_bytes(8, "little"))
+        f.write(hb)
+        for t in state_dict.values():
+            f.write(t.detach().contiguous().cpu().view(-1).view(torch.uint8).numpy().tobytes())
+    os.replace(tmp, path)
+
+
 def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler]:
     """Set optimizer and scheduler."""
     param_groups = build_param_lr_groups(model=model, cfg=cfg)
-    optimizer = torch.optim.AdamW(
-        param_groups,
+    adam_kwargs = dict(
         lr=cfg.trainer.learning_rate.base,
         betas=tuple(cfg.trainer.optimizer.betas),
         weight_decay=cfg.trainer.optimizer.weight_decay,
         eps=cfg.trainer.optimizer.eps,
-        fused=True,
     )
+    from accelerate.state import AcceleratorState
+
+    ds_plugin = AcceleratorState().deepspeed_plugin
+    zero_cfg = ds_plugin.deepspeed_config.get("zero_optimization", {}) if ds_plugin else {}
+    if zero_cfg.get("offload_optimizer", {}).get("device") == "cpu":
+        # ZeRO-Offload rejects torch optimizers; DeepSpeedCPUAdam is the AdamW (adamw_mode) it expects.
+        from deepspeed.ops.adam import DeepSpeedCPUAdam
+
+        optimizer = DeepSpeedCPUAdam(param_groups, adamw_mode=True, **adam_kwargs)
+    else:
+        optimizer = torch.optim.AdamW(param_groups, fused=True, **adam_kwargs)
 
     if dist.is_initialized() and dist.get_rank() == 0:
         for group in optimizer.param_groups:
@@ -127,6 +167,9 @@ class VLATrainer(TrainerUtils):
 
         self.completed_steps = 0
         self.total_batch_size = self._calculate_total_batch_size()
+        self.tb_writer = None
+        self._window = self._new_window()
+        self._val_sets = None
 
     def prepare_training(self):
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -166,7 +209,8 @@ class VLATrainer(TrainerUtils):
                 self.vla_train_dataloader,
             )
 
-        self._init_wandb()
+        self._init_trackers()
+        self._build_val_sets()
 
     def _calculate_total_batch_size(self):
         """Calculate global batch size."""
@@ -176,17 +220,99 @@ class VLATrainer(TrainerUtils):
             * self.accelerator.gradient_accumulation_steps
         )
 
-    def _init_wandb(self):
-        """Initialize Weights & Biases."""
+    def _init_trackers(self):
+        """Initialize TensorBoard (<output_dir>/tensorboard) and Weights & Biases.
+
+        The wandb mode is $WANDB_MODE if set, else the `wandb_mode` config key (default "offline":
+        runs land in <output_dir>/wandb and can be uploaded later with `wandb sync`).
+        """
         if self.accelerator.is_main_process:
+            self.tb_writer = SummaryWriter(log_dir=os.path.join(self.config.output_dir, "tensorboard"))
+            mode = os.environ.get("WANDB_MODE") or getattr(self.config, "wandb_mode", None) or "offline"
+            os.makedirs(os.path.join(self.config.output_dir, "wandb"), exist_ok=True)
+            run_config = OmegaConf.to_container(self.config, resolve=True)
+            sources = getattr(getattr(self.vla_train_dataloader, "dataset", None), "datasets", [])
+            run_config["data_sources"] = {
+                s.config.name: {"weight": s.config.weight, "frames": len(s),
+                                "embodiment": s.config.embodiment or s.config.robot_type}
+                for s in sources if hasattr(s, "config")
+            }
             wandb.init(
                 name=self.config.run_id,
                 dir=os.path.join(self.config.output_dir, "wandb"),
                 project=self.config.wandb_project,
                 entity=self.config.wandb_entity,
                 group="vla-train",
-                mode="offline"
+                mode=mode,
+                config=run_config,
             )
+            logger.info(f"Trackers: TensorBoard at {self.tb_writer.log_dir}, wandb mode={mode}")
+
+    def _build_val_sets(self):
+        """Fixed per-source validation samples from `trainer.val_data_config_path` (optional).
+
+        Each enabled source of that data config contributes `trainer.val_samples_per_source`
+        frames, drawn once with a fixed seed, so every validation pass sees the same inputs.
+        """
+        path = getattr(self.config.trainer, "val_data_config_path", None)
+        if not path or not self.accelerator.is_main_process:
+            return
+        from unifolm_wla.dataloader.multi_source_dataset.config import load_config
+        from unifolm_wla.dataloader.multi_source_dataset.single_source_dataset import create_single_source_dataset
+
+        n = int(getattr(self.config.trainer, "val_samples_per_source", 64))
+        vcfg = load_config(path)
+        rng = np.random.default_rng(0)
+        self._val_sets = {}
+        for sc in vcfg.datasets:
+            if not sc.enabled:
+                continue
+            ds = create_single_source_dataset(sc, vcfg)
+            idx = np.sort(rng.choice(len(ds), size=min(n, len(ds)), replace=False)).tolist()
+            self._val_sets[sc.name] = (ds, idx)
+            logger.info(f"Validation source {sc.name}: {len(idx)} of {len(ds)} frames")
+
+    @torch.no_grad()
+    def validate(self) -> dict:
+        """Per-source open-loop validation on the fixed samples of `_build_val_sets`.
+
+        val/<source>/masked_mse   normalized-space MSE of predict_action over the action_mask dims
+        val/<source>/ee_pos_mm    mean relative-EE xyz error (both arms), in mm, de-normalized
+        The diffusion noise is seeded, so the passes are comparable step to step.
+        """
+        if not self._val_sets:
+            return {}
+        from unifolm_wla.dataloader.multi_source_dataset.action_mapping import SLICES
+        from unifolm_wla.dataloader.multi_source_dataset.dataloader import collate_fn
+
+        model = self.accelerator.unwrap_model(self.model)
+        was_training = model.training
+        model.eval()
+        bs = int(getattr(self.config.trainer, "val_batch_size", 8))
+        horizon = model.action_horizon
+        ee = np.r_[np.arange(54)[SLICES["left_xyz_rotvec"]][:3], np.arange(54)[SLICES["right_xyz_rotvec"]][:3]]
+        out = {}
+        with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+            torch.manual_seed(0)
+            for name, (ds, idx) in self._val_sets.items():
+                se, cnt, ee_err = 0.0, 0, []
+                for i in range(0, len(idx), bs):
+                    batch = collate_fn([ds[j] for j in idx[i:i + bs]])
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        pred = model.predict_action(examples=batch)["normalized_actions"].astype(np.float64)
+                    gt = batch["action"].numpy()[:, -horizon:, :].astype(np.float64)
+                    m = batch["action_mask"].numpy()[:, None, :].astype(bool)
+                    se += float((((pred - gt) ** 2) * m).sum())
+                    cnt += int(m.sum()) * gt.shape[1]
+                    scale = batch["action_norm_scale"].numpy()[:, None, :]
+                    d = (pred - gt) * scale
+                    ee_err.append(np.linalg.norm(d[..., ee].reshape(*d.shape[:2], 2, 3), axis=-1).mean(axis=(1, 2)))
+                out[f"val/{name}/masked_mse"] = se / max(cnt, 1)
+                out[f"val/{name}/ee_pos_mm"] = float(np.concatenate(ee_err).mean() * 1e3)
+        if was_training:
+            model.train()
+        logger.info(f"Step {self.completed_steps} validation: {out}")
+        return out
 
     def _save_initial_configs(self):
         """Save full config and training script at the very start of training."""
@@ -273,17 +399,22 @@ class VLATrainer(TrainerUtils):
         self.accelerator.load_state(checkpoint_path)
         self.accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
 
+    def _full_state_dict(self):
+        ds_plugin = self.accelerator.state.deepspeed_plugin
+        if ds_plugin is not None and ds_plugin.zero_stage == 3:
+            return self.accelerator.get_state_dict(self.model)
+        # ZeRO <= 2 keeps full params on every rank; get_state_dict would first clone them all to host RAM.
+        return self.accelerator.unwrap_model(self.model).state_dict()
+
     def _save_checkpoint(self):
         """Save current training state."""
         if self.accelerator.is_main_process:
             save_format = getattr(self.config.trainer, "save_format", "pt")
             checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
 
-            state_dict = self.accelerator.get_state_dict(self.model)
+            state_dict = self._full_state_dict()
             if save_format == "safetensors":
-                from safetensors.torch import save_file
-
-                save_file(state_dict, checkpoint_path + "_model.safetensors")
+                save_safetensors_streaming(state_dict, checkpoint_path + "_model.safetensors")
             elif save_format == "pt":
                 torch.save(state_dict, checkpoint_path + "_pytorch_model.pt")
             else:
@@ -305,16 +436,63 @@ class VLATrainer(TrainerUtils):
 
         self.accelerator.wait_for_everyone()
 
-    def _log_metrics(self, metrics):
-        """Record training metrics."""
-        if self.completed_steps % self.config.trainer.logging_frequency == 0 and dist.get_rank() == 0:
-            last_lrs = self.lr_scheduler.get_last_lr()
-            for i, group in enumerate(self.optimizer.param_groups):
-                group_name = group.get("name", str(i))
-                metrics[f"learning_rate/{group_name}"] = last_lrs[i] if i < len(last_lrs) else last_lrs[-1]
-            metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
-            wandb.log(metrics, step=self.completed_steps)
-            logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
+    @staticmethod
+    def _new_window() -> dict:
+        return {"loss": collections.defaultdict(list), "data_s": 0.0, "model_s": 0.0, "samples": 0,
+                "sources": collections.Counter(), "grad_norm": [], "t0": time.perf_counter()}
+
+    def _accumulate(self, step_metrics: dict, batch, t_data: float, t_model: float):
+        """Fold one micro-step into the current logging window."""
+        w = self._window
+        for k, v in step_metrics.items():
+            w["loss"][k].append(v)
+        w["data_s"] += t_data
+        w["model_s"] += t_model
+        if isinstance(batch, dict) and "action" in batch:
+            w["samples"] += int(batch["action"].shape[0])
+            w["sources"].update(batch.get("source", []))
+
+    def _log_metrics(self, extra: dict | None = None):
+        """Log the window since the last call, once per optimizer step (every `logging_frequency`).
+
+        Losses are averaged over all micro-steps of the window (i.e. over the accumulation window),
+        timings are per optimizer step, `data/frac/<source>` is the realized mixture.
+        """
+        if not self.accelerator.is_main_process:
+            self._window = self._new_window()
+            return
+        w, steps = self._window, max(1, self.config.trainer.logging_frequency)
+        wall = time.perf_counter() - w["t0"]
+        metrics = {f"train/{k}": float(np.mean(v)) for k, v in w["loss"].items() if v}
+        if w["grad_norm"]:
+            metrics["train/grad_norm"] = float(np.mean(w["grad_norm"]))
+        last_lrs = self.lr_scheduler.get_last_lr()
+        for i, group in enumerate(self.optimizer.param_groups):
+            group_name = group.get("name", str(i))
+            metrics[f"learning_rate/{group_name}"] = last_lrs[i] if i < len(last_lrs) else last_lrs[-1]
+        metrics["timing/data"] = w["data_s"] / steps
+        metrics["timing/model"] = w["model_s"] / steps
+        metrics["timing/step"] = wall / steps
+        metrics["perf/samples_per_s"] = w["samples"] / max(wall, 1e-9)
+        if torch.cuda.is_available():
+            metrics["perf/gpu_mem_peak_gb"] = torch.cuda.max_memory_allocated() / 2**30
+        n = sum(w["sources"].values())
+        for src, c in w["sources"].items():
+            metrics[f"data/frac/{src}"] = c / n
+        metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 4)
+        metrics.update(extra or {})
+        self._emit(metrics)
+        self._window = self._new_window()
+
+    def _emit(self, metrics: dict):
+        if not self.accelerator.is_main_process:
+            return
+        wandb.log(metrics, step=self.completed_steps)
+        if self.tb_writer is not None:
+            for k, v in metrics.items():
+                self.tb_writer.add_scalar(k, v, self.completed_steps)
+            self.tb_writer.flush()
+        logger.info(f"Step {self.completed_steps}: " + ", ".join(f"{k}={v:.4g}" for k, v in metrics.items()))
 
     def _create_data_iterators(self):
         """Create data iterators."""
@@ -344,6 +522,13 @@ class VLATrainer(TrainerUtils):
             disable=not self.accelerator.is_local_main_process,
         )
 
+        # Validation before the first update, so the val/* curves start at the loaded checkpoint
+        # (the base model on a fresh run).
+        if getattr(self.config.trainer, "val_at_start", True) and self._val_sets:
+            self._emit(self.validate())
+        if dist.is_initialized():
+            dist.barrier()
+
         while self.completed_steps < self.config.trainer.max_train_steps:
             t_start_data = time.perf_counter()
             batch_vla = self._get_next_batch()
@@ -353,7 +538,11 @@ class VLATrainer(TrainerUtils):
             step_metrics = self._train_step(batch_vla)
             t_end_model = time.perf_counter()
 
-            if self.accelerator.sync_gradients:
+            # completed_steps only advances on the micro-step that syncs gradients; gate eval/save on
+            # it too, or every micro-step of an accumulation window re-runs them (up to
+            # gradient_accumulation_steps saves of the full ~12.5 GB model per save point).
+            synced = self.accelerator.sync_gradients
+            if synced:
                 progress_bar.update(1)
                 self.completed_steps += 1
 
@@ -365,14 +554,23 @@ class VLATrainer(TrainerUtils):
                     }
                 )
 
-            if self.completed_steps % self.config.trainer.eval_interval == 0:
-                step_metrics = self.eval_action_model(step_metrics)
+            self._accumulate(step_metrics, batch_vla, t_end_data - t_start_data, t_end_model - t_start_model)
+            if synced:
+                gn = self._grad_norm()
+                if gn is not None:
+                    self._window["grad_norm"].append(gn)
 
-            step_metrics["timing/data"] = t_end_data - t_start_data
-            step_metrics["timing/model"] = t_end_model - t_start_model
-            self._log_metrics(step_metrics)
+            extra = {}
+            if synced and self.completed_steps % self.config.trainer.eval_interval == 0:
+                extra = self.eval_action_model({})
+                extra.update(self.validate())
+                if dist.is_initialized():
+                    dist.barrier()
 
-            if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
+            if synced and (self.completed_steps % self.config.trainer.logging_frequency == 0 or extra):
+                self._log_metrics(extra)
+
+            if synced and self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
                 self._save_checkpoint()
 
             if self.completed_steps >= self.config.trainer.max_train_steps:
@@ -395,7 +593,7 @@ class VLATrainer(TrainerUtils):
             actions = np.array(actions)
             num_pots = np.prod(actions.shape)
             score = TrainerUtils.euclidean_distance(normalized_actions, actions)
-            step_metrics["mse_score"] = score / num_pots
+            step_metrics["train/mse_score"] = score / num_pots
 
         del examples
         if dist.is_initialized():
@@ -410,6 +608,18 @@ class VLATrainer(TrainerUtils):
             logger.info(f"  Per device batch size = {self.config.datasets.vla_data.per_device_batch_size}")
             logger.info(f"  Gradient accumulation steps = {self.accelerator.gradient_accumulation_steps}")
             logger.info(f"  Total batch size = {self.total_batch_size}")
+
+    def _grad_norm(self):
+        """Global grad norm of the last optimizer step (DeepSpeed computes it; accelerate's
+        clip_grad_norm_ returns None under DeepSpeed)."""
+        fn = getattr(self.model, "get_global_grad_norm", None)
+        if fn is None:
+            return None
+        gn = fn()
+        if gn is None:
+            return None
+        gn = float(gn.item() if torch.is_tensor(gn) else gn)
+        return gn if np.isfinite(gn) else None
 
     def _train_step(self, batch_vla, batch_vlm=None):
         """Execute single training step."""
@@ -450,11 +660,9 @@ class VLATrainer(TrainerUtils):
             save_format = getattr(self.config.trainer, "save_format", "pt")
             final_checkpoint = os.path.join(self.config.output_dir, "final_model")
             os.makedirs(final_checkpoint, exist_ok=True)
-            state_dict = self.accelerator.get_state_dict(self.model)
+            state_dict = self._full_state_dict()
             if save_format == "safetensors":
-                from safetensors.torch import save_file
-
-                save_file(state_dict, os.path.join(final_checkpoint, "model.safetensors"))
+                save_safetensors_streaming(state_dict, os.path.join(final_checkpoint, "model.safetensors"))
             elif save_format == "pt":
                 torch.save(state_dict, os.path.join(final_checkpoint, "pytorch_model.pt"))
             else:
@@ -467,6 +675,8 @@ class VLATrainer(TrainerUtils):
 
         if self.accelerator.is_main_process:
             wandb.finish()
+            if self.tb_writer is not None:
+                self.tb_writer.close()
 
         self.accelerator.wait_for_everyone()
 

@@ -7,21 +7,59 @@ import os
 import shutil
 import sys
 import uuid
+from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
 
 import datasets
+import torch
 from datasets import load_dataset as hf_load_dataset
 import datasets.config as hf_datasets_config
 import pyarrow.dataset as pa_ds
 
 from .distributed_utils import safe_ddp_context
 
+import lerobot.datasets.video_utils as lerobot_video_utils
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import get_hf_features_from_features, hf_transform_to_torch
 
 _SYSTEM_KEYS = {"index", "episode_index", "frame_index", "timestamp", "task_index", "subtask_index"}
 logger = logging.getLogger(__name__)
+
+
+class BoundedVideoDecoderCache(lerobot_video_utils.VideoDecoderCache):
+    """LRU-bounded drop-in for lerobot's VideoDecoderCache.
+
+    lerobot keeps one torchcodec decoder (+ open file) per video path forever, in every dataloader
+    worker. With one video per episode and camera (HIW: 2610 files) that grows each worker by GBs
+    until the host OOMs; this evicts the least recently used decoder beyond `max_size`.
+    """
+
+    def __init__(self, max_size: int):
+        super().__init__()
+        self._cache = OrderedDict()
+        self.max_size = max_size
+
+    def get_decoder(self, video_path: str):
+        from torchcodec.decoders import VideoDecoder
+
+        video_path = str(video_path)
+        with self._lock:
+            if video_path in self._cache:
+                self._cache.move_to_end(video_path)
+            else:
+                file_handle = lerobot_video_utils.fsspec.open(video_path).__enter__()
+                self._cache[video_path] = (VideoDecoder(file_handle, seek_mode="approximate"), file_handle)
+                while len(self._cache) > self.max_size:
+                    _, (_, old_handle) = self._cache.popitem(last=False)
+                    old_handle.close()
+            return self._cache[video_path][0]
+
+
+# decode_video_frames_torchcodec reads this module global at call time.
+lerobot_video_utils._default_decoder_cache = BoundedVideoDecoderCache(
+    int(os.environ.get("UNIFOLM_WLA_VIDEO_DECODER_CACHE", "96"))
+)
 
 
 @contextmanager
@@ -83,6 +121,45 @@ class LeRobotDatasetWithSelectedKeys(LeRobotDataset):
     @property
     def active_camera_keys(self) -> list[str]:
         return [k for k, ft in self.features.items() if ft["dtype"] in ["video", "image"]]
+
+    def _check_cached_episodes_sufficient(self) -> bool:
+        """Like LeRobotDataset, but only the selected cameras must be on disk.
+
+        A partial mirror drops IR and rectified copies. The parent check treats those
+        missing files as a cache miss and then tries to download `repo_id` from the Hub.
+        """
+        if self._selected_keys is None:
+            return super()._check_cached_episodes_sufficient()
+        if self.hf_dataset is None or len(self.hf_dataset) == 0:
+            return False
+        available = {
+            ep.item() if hasattr(ep, "item") else ep
+            for ep in self.hf_dataset.unique("episode_index")
+        }
+        requested = set(range(self.meta.total_episodes)) if self.episodes is None else set(self.episodes)
+        if not requested.issubset(available):
+            return False
+        for ep_idx in requested:
+            for vid_key in self.active_video_keys:
+                if not (self.root / self.meta.get_video_file_path(ep_idx, vid_key)).exists():
+                    return False
+        return True
+
+    def _get_query_timestamps(self, current_ts: float, query_indices: dict[str, list[int]] | None = None) -> dict[str, list[float]]:
+        if self._selected_keys is None:
+            return super()._get_query_timestamps(current_ts, query_indices)
+        query_timestamps = {}
+        for key in self.active_video_keys:
+            if query_indices is not None and key in query_indices:
+                if self._absolute_to_relative_idx is not None:
+                    relative_indices = [self._absolute_to_relative_idx[idx] for idx in query_indices[key]]
+                    timestamps = self.hf_dataset[relative_indices]["timestamp"]
+                else:
+                    timestamps = self.hf_dataset[query_indices[key]]["timestamp"]
+                query_timestamps[key] = torch.stack(timestamps).tolist()
+            else:
+                query_timestamps[key] = [current_ts]
+        return query_timestamps
 
     def _get_arrow_cache_key(self, columns: list[str] | None) -> str | None:
         """Return a deterministic Arrow cache key, or None if cache_dir is not set."""

@@ -1,5 +1,6 @@
 """Per-source dataset wrapper that loads LeRobotDataset(s) and produces unified output."""
 
+import json
 import logging
 from pathlib import Path
 import random
@@ -147,10 +148,14 @@ class SingleSourceDataset(Dataset):
                 raise FileNotFoundError(f"No task directories found in {data_path}")
             for td in task_dirs:
                 self._task_dirs.append(td)
+                # Partial mirrors list the episodes whose files are on disk; the rest must not be loaded.
+                allow = td / "meta" / "train_episodes.json"
+                episodes = json.loads(allow.read_text()) if allow.is_file() else None
                 try:
                     ds = LeRobotDatasetWithSelectedKeys(
                         repo_id=td.name,
                         root=td,
+                        episodes=episodes,
                         delta_timestamps=self.delta_timestamps,
                         tolerance_s=1.0 / self.source_fps,
                         selected_keys=self.selected_keys,
@@ -527,6 +532,8 @@ class SingleSourceDataset(Dataset):
             "task": task,
             "arm_type": self.config.arm_type,
             "robot_type": self.config.robot_type,
+            "embodiment": self.config.embodiment or self.config.robot_type,
+            "source": self.config.name,
         }
 
     def _to_numpy(self, val) -> np.ndarray:

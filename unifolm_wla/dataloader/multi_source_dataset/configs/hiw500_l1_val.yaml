@@ -1,0 +1,78 @@
+# Per-source validation data for the hiw500_l1.yaml co-training run (trainer.val_data_config_path).
+# Same keys, names and normalization as the training groups; neither group is ever trained on:
+#   HIW500_L1_G1Dex1   <- HIW500_L1_G1Dex1_heldout/ (convert_hiw_l1.py held-out split)
+#   UnifoLM_G1_Dex1    <- UnifoLM_G1_Dex1_val/      (build_unitree_replay.py validation split)
+target_fps: 30
+chunk_size: 30
+image_size: [336, 448]
+norm_type: "minmax_q"
+rel_norm_type: "zscore"
+state_norm_type: "minmax_q"
+gripper_norm_type: "minmax_q"
+data_base: "/home/mark.lee/manipulation/wla_data"
+cache_dir: "/home/mark.lee/manipulation/wla_data/cache_hiw500_l1"
+
+.unitree_base: &unitree_base
+  enabled: true
+  weight: 1.0
+  robot_type: "unitree"
+  source_fps: 30
+  arm_type: "dual_with_legs"
+  ee_format: "xyz_rpy"
+  multi_task: true
+  merge_left_right_ee_stats: true
+  precollected_stats_path: "unifolm_wla/dataloader/multi_source_dataset/stats"
+  image_keys:
+    - key: "observation.images.head_stereo_left"
+      role: "head_left"
+    - key: "observation.images.wrist_left"
+      role: "cam_wrist_left"
+    - key: "observation.images.wrist_right"
+      role: "cam_wrist_right"
+  action_keys:
+    left_ee_pose: "action.left_ee_pose_gripper_base"
+    right_ee_pose: "action.right_ee_pose_gripper_base"
+    left_gripper: "action.left_gripper"
+    right_gripper: "action.right_gripper"
+    waist_joint: "action.waist_action_joint"
+    base_command: "action.base_command"
+    left_leg: "action.left_leg"
+    right_leg: "action.right_leg"
+  state_keys:
+    left_ee_pose: "observation.state.left_ee_pose_gripper_base"
+    right_ee_pose: "observation.state.right_ee_pose_gripper_base"
+    left_gripper: "observation.state.left_gripper"
+    right_gripper: "observation.state.right_gripper"
+    waist_joint: "observation.state.waist_state_joint"
+    left_leg: "observation.state.left_leg"
+    right_leg: "observation.state.right_leg"
+  relative_stats_key_map:
+    left_ee_pose: "left_ee_pose_gripper_base"
+    right_ee_pose: "right_ee_pose_gripper_base"
+  base_command_dims:
+    vx: 0
+    vy: 1
+    vw: 2
+    height: 3
+
+image_roles:
+  - "head_left"
+  - "cam_wrist_left"
+  - "cam_wrist_right"
+
+datasets:
+  - <<: *unitree_base
+    name: "UnifoLM_G1_Dex1"
+    data_path: "UnifoLM_G1_Dex1_val/"
+
+  - <<: *unitree_base
+    name: "HIW500_L1_G1Dex1"
+    data_path: "HIW500_L1_G1Dex1_heldout/"
+    embodiment: "unitree_hiw"
+    action_keys:
+      left_ee_pose: "action.left_ee_pose_gripper_base"
+      right_ee_pose: "action.right_ee_pose_gripper_base"
+      left_gripper: "action.left_gripper"
+      right_gripper: "action.right_gripper"
+      waist_joint: "action.waist_action_joint"
+      base_command: "action.base_command"
